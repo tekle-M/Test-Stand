@@ -4,6 +4,7 @@ import (
 	"errors"
 	"github.com/streadway/amqp"
 	"log"
+	"sync"
 	"time"
 	// "errors"
 )
@@ -17,6 +18,7 @@ const (
 type Consumer struct {
 	url                    string
 	conn                   *amqp.Connection
+	mutex                  *sync.Mutex
 	channels               map[string]*amqp.Channel
 	ConnectionCloseTimeout int
 	MaxRecoveryAttempts    int
@@ -32,35 +34,31 @@ func NewConsumer(url string) (Consumer, error) {
 	}
 	log.Println("Consumer connected")
 	return Consumer{
-		url:      url,
-		conn:     conn,
-		channels: make(map[string]*amqp.Channel),
+		url:                    url,
+		conn:                   conn,
+		mutex:                  &sync.Mutex{},
+		channels:               make(map[string]*amqp.Channel),
+		ConnectionCloseTimeout: 5,
+		MaxRecoveryAttempts:    3,
 	}, nil
 }
-
-func (cns *Consumer) Consume(queueName string, th2Pin string, th2Type string, handler func(delivery amqp.Delivery) error) error {
-
-	connErr := make(chan *amqp.Error, 1)
-	chanErr := make(chan *amqp.Error, 1)
-
-	go func(cn chan *amqp.Error) {
-		log.Println("in cON")
-
-		//cn <- <-pb.conn.NotifyClose(make(chan *amqp.Error, 1)) //Listen to NotifyClose
-		cn <- &amqp.Error{Code: amqp.AccessRefused} //for test
-
-	}(connErr)
-
-	ch, err := cns.conn.Channel()
-	if err != nil {
-		log.Println("cannot open channel")
-		return err
-	}
-	cns.channels[queueName] = ch
-	var msgs <-chan amqp.Delivery
+func (cns *Consumer) subs(queueName string, msgs <-chan amqp.Delivery, connErr chan *amqp.Error, wg *sync.WaitGroup) {
 	for i := 0; i < cns.MaxRecoveryAttempts; i++ {
+		log.Printf("attempt : %v", i+1)
+
+		select {
+		case errRes := <-connErr:
+			errH := cns.connErrorHandling(errRes, queueName)
+			if errH != nil {
+				log.Panicln("Failed to publish message to RabbitMQ:")
+			}
+			log.Println("handled errors ")
+
+		default:
+		}
+
 		var consErr error
-		msgs, consErr = ch.Consume(
+		msgs, consErr = cns.channels[queueName].Consume(
 			queueName, // queue
 			// TODO: we need to provide a name that will help to identify the component
 			"",    // consumer
@@ -71,42 +69,107 @@ func (cns *Consumer) Consume(queueName string, th2Pin string, th2Type string, ha
 			nil,   // args
 		)
 		if consErr == nil {
-			log.Println("Consuming error")
-			return consErr
+			log.Println("Consumed")
+			wg.Add(1)
+			break
 		}
-		errH := cns.connErrorHandling(connErr)
-		if errH != nil {
-			log.Println("Failed to publish message to RabbitMQ:")
-		}
-		errch := cns.chanErrorHandling(chanErr, queueName)
-		if errch != nil {
-			log.Println("Failed to recover channel")
-
-		}
+		log.Printf("error Consuming", connErr)
 
 	}
+}
+
+func (cns *Consumer) Consume(queueName string) error {
+	cns.mutex.Lock()
+
+	ch, err := cns.conn.Channel()
+	if err != nil {
+		log.Println("cannot open channel")
+		return err
+	}
+	cns.channels[queueName] = ch
+	cns.mutex.Unlock()
+
+	log.Println("got channel")
+
+	connErr := make(chan *amqp.Error, 1)
+	//chanErr := make(chan *amqp.Error, 1)
+
+	go func(cn chan *amqp.Error) {
+		log.Println("in cON")
+
+		//cn <- <-pb.conn.NotifyClose(make(chan *amqp.Error, 1)) //Listen to NotifyClose
+		cn <- &amqp.Error{Code: amqp.AccessRefused} //for test
+
+	}(connErr)
+	var wg sync.WaitGroup
+	//cns.conn.Close()
+	var msgs <-chan amqp.Delivery
+	cns.conn.Close() //for test
+
+	for i := 0; i < cns.MaxRecoveryAttempts; i++ {
+		log.Printf("attempt : %v", i+1)
+
+		select {
+		case errRes := <-connErr:
+			errH := cns.connErrorHandling(errRes, queueName)
+			if errH != nil {
+				log.Panicln("Failed to publish message to RabbitMQ:")
+			}
+			log.Println("handled errors ")
+
+		default:
+		}
+
+		var consErr error
+		msgs, consErr = cns.channels[queueName].Consume(
+			queueName, // queue
+			// TODO: we need to provide a name that will help to identify the component
+			"",    // consumer
+			true,  // auto-ack
+			false, // exclusive
+			false, // no-local
+			false, // no-wait
+			nil,   // args
+		)
+		if consErr == nil {
+			log.Println("Consumed")
+			wg.Add(1)
+			break
+		}
+		log.Printf("error Consuming", connErr)
+
+	}
+	//cns.conn.Close()//for test
 
 	go func() {
-		log.Println("start handling messages")
-		for d := range msgs {
-			log.Println("receive delivery")
-			if err := handler(d); err != nil {
-				log.Println("Cannot handle delivery")
+		defer wg.Done()
+		for {
+			if !cns.conn.IsClosed() && msgs != nil {
+				log.Println("in default")
+
+				for d := range msgs {
+					log.Printf("receive delivery: %s", d.Body)
+				}
+				break
+
+			} else {
+				cns.subs(queueName, msgs, connErr, &wg)
+				continue
 			}
 		}
-		log.Println("stop handling messages")
 	}()
-
+	wg.Wait()
+	log.Println("done")
 	return nil
 }
 func (cns *Consumer) Close() error {
 	return cns.conn.Close()
 }
 
-func (cns *Consumer) connErrorHandling(ch chan *amqp.Error) error {
+func (cns *Consumer) connErrorHandling(ch *amqp.Error, name string) error {
 	res := make(chan error, 1)
 	go func() {
-		res <- cns.handleConnectionErr(ch)
+		res <- cns.handleConnectionErr(ch, name)
 	}()
 	select {
 	case <-time.After(time.Duration(cns.ConnectionCloseTimeout) * time.Second):
@@ -117,25 +180,27 @@ func (cns *Consumer) connErrorHandling(ch chan *amqp.Error) error {
 	return nil
 }
 
-func (cns *Consumer) handleConnectionErr(connErr chan *amqp.Error) error {
-	select {
-	case err := <-connErr:
-		switch err.Code {
-		case amqp.AccessRefused:
-			log.Println("Access refused error:", err)
-		case amqp.ConnectionForced:
-			log.Println("Connection forced error:", err)
-		default:
-			log.Println("Unknown error:", err)
-		}
-		errR := cns.reconnect()
-		if errR != nil {
-			return errR
-		}
-
+func (cns *Consumer) handleConnectionErr(connErr *amqp.Error, name string) error {
+	switch connErr.Code {
+	case amqp.AccessRefused:
+		log.Println("Access refused error:", connErr)
+	case amqp.ConnectionForced:
+		log.Println("Connection forced error:", connErr)
 	default:
-		return nil
+		log.Println("Unknown error:", connErr)
 	}
+	errR := cns.reconnect()
+	if errR != nil {
+		return errR
+	}
+	chann, err := cns.conn.Channel()
+	if err != nil {
+		return err
+	}
+	cns.mutex.Lock()
+	defer cns.mutex.Unlock()
+	cns.channels[name] = chann
+	log.Println("Channel recovered")
 	return nil
 }
 func (cns *Consumer) reconnect() error {
@@ -210,9 +275,10 @@ func (cns *Consumer) chanErrorHandling(ch chan *amqp.Error, name string) error {
 }
 func main() {
 	connector, _ := NewConsumer("amqp://guest:guest@localhost:5672/")
-	err := connector.Close()
+
+	err := connector.Consume(QUEUE_NAME)
 	if err != nil {
 		log.Println(err)
 	}
-	
+
 }
