@@ -49,44 +49,38 @@ func (pb *Publisher) Publish(body []byte, routingKey string, exchange string, th
 		log.Printf("Failed toget channel:", err)
 		return err
 	}
+	pb.channels[routingKey] = ch
 
 	connErr := make(chan *amqp.Error, 1)
-	chanErr := make(chan *amqp.Error, 1)
-
-	go func(cn chan *amqp.Error) {
-		log.Println("in cON")
-
-		//cn <- <-pb.conn.NotifyClose(make(chan *amqp.Error, 1)) //Listen to NotifyClose
-		cn <- &amqp.Error{Code: amqp.AccessRefused} //for test
+	go func(cn chan<- *amqp.Error) {
+		cn <- <-pb.conn.NotifyClose(make(chan *amqp.Error, 1)) //Listen to NotifyClose
+		//cn <- &amqp.Error{Code: amqp.AccessRefused} //for test
 
 	}(connErr)
 
-	go func(chn chan *amqp.Error) {
-		//log.Println("in chaN")
-		//chn <- <-pb.channels[routingKey].NotifyClose(make(chan *amqp.Error, 1))
-		chn <- &amqp.Error{Code: amqp.AccessRefused} //for testing
-
-	}(chanErr)
-	pb.conn.Close()
-	for {
-		publError := ch.Publish(exchange, routingKey, false, false, amqp.Publishing{Body: body})
-		if publError != nil {
-			log.Println(publError)
-			//return nil
+	//pb.conn.Close()
+	for i := 0; i < pb.MaxRecoveryAttempts; i++ {
+		select {
+		case errRes := <-connErr:
+			errH := pb.connErrorHandling(errRes, routingKey)
+			if errH != nil {
+				log.Println("Failed to publish message to RabbitMQ:")
+				return errH
+			}
+		default:
 		}
-		errH := pb.connErrorHandling(connErr)
-		if errH != nil {
-			log.Println("Failed to publish message to RabbitMQ:")
+		publError := pb.channels[routingKey].Publish(exchange, routingKey, false, false, amqp.Publishing{Body: body})
+		if publError == nil {
+			log.Println("published")
+			break
 		}
-		errch := pb.chanErrorHandling(chanErr, routingKey)
-		if errch != nil {
-			log.Println("Failed to recover channel")
-
-		}
+		log.Println(publError)
 
 	}
 	//bodySize := len(body)
 	//loger.Trace().Int("size", bodySize).Msg("data published")
+	return nil
+
 }
 
 func (pb *Publisher) Close() error {
@@ -121,10 +115,10 @@ func (pb *Publisher) getOrCreateChannel(routingKey string) (*amqp.Channel, error
 	}
 	return ch, nil
 }
-func (pb *Publisher) connErrorHandling(ch chan *amqp.Error) error {
+func (pb *Publisher) connErrorHandling(ch *amqp.Error, name string) error {
 	res := make(chan error, 1)
 	go func() {
-		res <- pb.handleConnectionErr(ch)
+		res <- pb.handleConnectionErr(ch, name)
 	}()
 	select {
 	case <-time.After(time.Duration(pb.ConnectionCloseTimeout) * time.Second):
@@ -135,25 +129,25 @@ func (pb *Publisher) connErrorHandling(ch chan *amqp.Error) error {
 	return nil
 }
 
-func (pb *Publisher) handleConnectionErr(connErr chan *amqp.Error) error {
-	select {
-	case err := <-connErr:
-		switch err.Code {
-		case amqp.AccessRefused:
-			log.Println("Access refused error:", err)
-		case amqp.ConnectionForced:
-			log.Println("Connection forced error:", err)
-		default:
-			log.Println("Unknown error:", err)
-		}
-		errR := pb.reconnect()
-		if errR != nil {
-			return errR
-		}
-
+func (pb *Publisher) handleConnectionErr(connErr *amqp.Error, name string) error {
+	switch connErr.Code {
+	case amqp.AccessRefused:
+		log.Println("Access refused error:", connErr)
+	case amqp.ConnectionForced:
+		log.Println("Connection forced error:", connErr)
 	default:
-		return nil
+		log.Println("Unknown error:", connErr)
 	}
+	errR := pb.reconnect()
+	if errR != nil {
+		return errR
+	}
+	chann, err := pb.conn.Channel()
+	if err != nil {
+		return err
+	}
+	pb.channels[name] = chann
+	log.Println("Channel recovered")
 	return nil
 }
 func (pb *Publisher) reconnect() error {
@@ -172,60 +166,7 @@ func (pb *Publisher) reconnect() error {
 	}
 	return err
 }
-func (pb *Publisher) handleChannelErrors(chn chan *amqp.Error, name string) error {
 
-	for {
-		errC := <-chn
-		if errC != nil {
-			log.Printf("Channel closed with error: %v, attempting to recover...", errC)
-			switch errC.Code {
-			case amqp.AccessRefused:
-				log.Println("access refused error, retrying...")
-				// here might go mechanism to solver this error if it is possible to do with code
-
-			case amqp.ChannelError:
-				log.Println("channel error, retrying in 5 seconds...")
-
-			default:
-				log.Printf("unknown error code: %d, retrying in 1 second...", errC.Code)
-			}
-			var err error
-			for i := 0; i < pb.MaxRecoveryAttempts; i++ {
-
-				// Attempt to re-establish the channel
-				//time.Sleep(time.Duration(cn.ConnectionCloseTimeout) * time.Second)//test
-				var chann *amqp.Channel
-				chann, err = pb.conn.Channel()
-				log.Printf("staret recreating %v", err)
-
-				if err == nil {
-					pb.channels[name] = chann
-					log.Printf("Channel recovered after error: %v", err)
-					return nil
-				}
-			}
-			return err
-		}
-	}
-
-}
-func (pb *Publisher) chanErrorHandling(ch chan *amqp.Error, name string) error {
-
-	res := make(chan error, 1)
-	go func() {
-		res <- pb.handleChannelErrors(ch, name)
-	}()
-	select {
-	case <-time.After(time.Duration(pb.ConnectionCloseTimeout) * time.Second):
-		//return errors.New("timed out")
-		log.Panicln("timed out")
-	case result := <-res:
-		return result
-	default:
-		return nil
-	}
-	return nil
-}
 func main() {
 	connector, _ := NewPublisher("amqp://guest:guest@localhost:5672/")
 	body := []byte("Hello, world!")
