@@ -142,6 +142,8 @@ func (pb *Publisher) handleConnectionErr(connErr *amqp.Error, name string) error
 	if errR != nil {
 		return errR
 	}
+	pb.mutex.Lock()
+	defer pb.mutex.Unlock()
 	chann, err := pb.conn.Channel()
 	if err != nil {
 		return err
